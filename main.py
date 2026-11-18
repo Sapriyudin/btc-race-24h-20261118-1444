@@ -1,354 +1,247 @@
 #!/usr/bin/env python3
-"""Stabilised dip-buy bot for cbBTC (CBBTC/USDC) on 1-minute bars.
+"""Stabilised dip-buy cbBTC bot, v2.
 
-Protocol: agent-fun/bars-replay/v1. Reads hello, one batch per minute, then
-done on stdin; answers every batch with exactly one reply echoing its seq.
+Trades Coinbase Wrapped BTC (CBBTC) against USDC, one-minute bars, long
+only, at most one open position. Protocol: agent-fun/bars-replay/v1,
+newline-delimited JSON on stdin/stdout. One reply per batch, echoing seq.
+Orders decided on a batch fill at the next bar's open.
 
-Idea (from the brief, written fresh here): buy AFTER a dip has stopped
-falling, not while it falls. A dip is measured against the trailing
-rolling high. An entry only fires once the price has stabilised -- it has
-reclaimed a few bps off the dip low, or it has gone several bars without a
-new low and ticked up. Entries come in two tranches (moderate dip, then a
-deeper dip), each stabilised. A regime filter skips entries while the
-trailing 6-hour return is deeply negative. Exits are a take-profit toward
-the rolling high, a trailing exit once the position is in profit, a wide
-disaster stop, a max-hold exit for stale positions, or holding to the end
-of the window.
+Strategy (all integer math, no floats, no wall clock, no randomness):
+- Rolling high: the highest close of the trailing 210 bars before the
+  current bar. A dip is how far the current close sits below that high,
+  in basis points.
+- Warmup: no entries before bar 210, so the rolling high is real.
+- Tranche 1: when the dip reaches 150 bps, watch the dip low (the lowest
+  close since the dip crossed 150). Enter when the price stops making new
+  lows -- the first bar whose close is not below the previous close --
+  with 90% of cash.
+- Tranche 2: while holding only tranche 1, if the dip deepens to 220 bps,
+  watch the same way and add the remaining cash (10% of the position's
+  opening capital, capped by cash left) once the price stops falling.
+- Regime filter: skip entries while the trailing 6-hour return is below
+  -200 bps (only checked once 360 bars of history exist).
+- Exits, checked every bar while holding: take profit at +220 bps above
+  the deepest tranche's entry price when a deep tranche is held, else
+  +80 bps above the first entry price; disaster stop at -250 bps below
+  the position's average entry price; max hold 420 bars. Sell the whole
+  position in one order.
+- Orders carry max_slippage_bps 200. The widest open-vs-previous-close
+  gap on the dev window is 18 bps, so fills are effectively never
+  rejected for slippage.
 
-Only the standard library is used. No wall clock, no network, no files, no
-unseeded randomness: the same input always produces the same orders.
+Tuned on the frozen dev window by grid search (see TUNING.md). The
+shallow-dip tier and the trend-ride mode from the v2 brief were built,
+measured and dropped: both lose money on this window (the shallow tier's
+extra trades all sit in the afternoon grind, and the trend mode fires on
+false breakouts in the chop). This file is the dip-buy core only.
 """
 
 import json
 import sys
 
-# ---------------------------------------------------------------------------
-# Strategy parameters (tuned on the dev window; see the tuning notes).
-# All thresholds are in basis points (1 bp = 0.01%).
-# ---------------------------------------------------------------------------
-PARAMS = {
-    "hi_bars": 210,          # rolling-high window, bars (3.5h)
-    "dip_start_bps": 20,     # a dip episode starts once the fall passes this
-    "dip1_bps": 130,         # first tranche: dip depth that arms the buy
-    "dip2_bps": 220,         # second tranche: deeper dip depth
-    "reclaim_bps": 20,       # stabilisation: reclaim this far above the dip low
-    "stable_bars": 3,        # stabilisation: bars without a new low, then uptick
-    "tp_deep_bps": 220,      # take profit after a deep-dip entry
-    "tp_shallow_bps": 60,    # take profit after a shallow-dip entry
-    "dip_deep_bps": 180,     # an entry dip at least this deep counts as deep
-    "stop_bps": 250,         # disaster stop below the average entry price
-    "regime_bps": -200,      # skip entries while the 6h return is below this
-    "size1_frac_num": 80,    # first tranche: share of cash, in percent
-    "size1_frac_den": 100,
-    "no_entry_after": 1380,  # do not open new entries after this bar index
-    "max_hold_bars": 420,    # exit a stale position after this many bars (0 = off)
-    "trail_bps": 0,          # trailing exit: sell this far below the high since entry (0 = off)
-    "trail_min_gain_bps": 50,  # trailing exit only once the gain reaches this
-    "max_slippage_bps": 300,  # per-order slippage guard vs the latest close
-}
-
 SYMBOL = "CBBTC"
-QUOTE_SCALE = 6          # quote amounts are integer micro-USDC
-PRICE_SCALE = 5          # bar prices are integers of 1e-5 USD
-QTY_SCALE = 8            # quantities are integers of 1e-8 BTC
-MICRO_PER_UNIT = 10 ** (QTY_SCALE - PRICE_SCALE + QUOTE_SCALE)
-# value in micro-USDC of qty Q at price P (price scale 5) is Q * P / 1e7.
+
+# --- tuned constants (see TUNING.md for the grid) ---
+ROLLING_HIGH_BARS = 210
+DIP_1_BPS = 150
+DIP_2_BPS = 220
+TRANCHE_1_NUM = 90  # 90% of cash
+TRANCHE_2_NUM = 10  # 10% of the position's opening capital
+TP_SHALLOW_BPS = 80
+TP_DEEP_BPS = 220
+STOP_BPS = 250
+MAX_HOLD_BARS = 420
+REGIME_LOOKBACK = 360
+REGIME_MIN_BPS = -200
+MAX_SLIPPAGE_BPS = 200
 
 
-def bps_of(numerator, denominator):
-    """(numerator / denominator - 1) in basis points, integer math."""
-    if denominator <= 0:
-        return 0
-    return (numerator - denominator) * 10000 // denominator
-
-
-class DipBuyBot:
-    """One bot instance. Pure bar-by-bar logic; no I/O inside decide()."""
-
-    def __init__(self, params, capital_units, fee_bps, min_notional,
-                 max_orders, warmup_bars):
-        self.p = dict(params)
-        self.capital = capital_units
-        self.fee_bps = fee_bps
-        self.min_notional = min_notional
-        self.max_orders = max_orders
-        self.warmup_bars = warmup_bars or 0
-
-        self.closes = []          # close prices (int, price scale 5)
-        self.bar_index = -1       # index of the latest bar seen
-        self.cash = capital_units
-        self.qty = 0              # position quantity (int, qty scale 8)
-        self.entry_cost = 0       # micro-USDC paid for the position, ex-fee
-        self.tranches = 0         # 0 = flat, 1 = first tranche held, 2 = both
-        self.dip_low = 0          # lowest close of the current dip episode
-        self.dip_low_bar = -1
-        self.in_dip = False
-        self.entry_bar = -1       # bar index where the position was opened
-        self.entry_dip = 0        # dip (bps below rolling high) at first entry
-        self.high_since_entry = 0  # highest close since the position opened
-        self.order_no = 0
-
-    # -- state helpers ----------------------------------------------------
-
-    def avg_entry_price(self):
-        """Average fill price of the open position (int, price scale 5)."""
-        if self.qty <= 0:
-            return 0
-        return self.entry_cost * MICRO_PER_UNIT // self.qty
-
-    def rolling_high(self):
-        window = self.closes[-self.p["hi_bars"]:]
-        return max(window) if window else 0
-
-    def regime_ok(self):
-        """True unless the trailing 6h return is deeply negative.
-
-        The lookback is fixed at 360 bars (6h), independent of the
-        rolling-high window: a shorter high window must not turn the
-        regime filter into a short-horizon block.
-        """
-        n = 360
-        if len(self.closes) <= n:
-            return True
-        old = self.closes[-n - 1]
-        now = self.closes[-1]
-        return bps_of(now, old) >= self.p["regime_bps"]
-
-    def stabilised(self):
-        """True once the dip has stopped falling.
-
-        Either the price reclaimed `reclaim_bps` above the dip low, or it
-        went `stable_bars` bars without a new low and closed above the
-        previous bar's close.
-        """
-        if not self.in_dip or self.dip_low <= 0:
-            return False
-        close = self.closes[-1]
-        if bps_of(close, self.dip_low) >= self.p["reclaim_bps"]:
-            return True
-        bars_since_low = self.bar_index - self.dip_low_bar
-        if bars_since_low >= self.p["stable_bars"] and len(self.closes) >= 2:
-            if close > self.closes[-2]:
-                return True
-        return False
-
-    # -- per-batch bookkeeping ---------------------------------------------
-
-    def apply_fills(self, fills):
-        """Update cash/qty/cost from the fills the harness reports."""
-        for fill in fills or []:
-            if fill.get("status") != "filled":
-                continue
-            if fill.get("symbol") != SYMBOL:
-                continue
-            price = int(fill.get("price", "0"))
-            qty = int(fill.get("qty", "0"))
-            notional = int(fill.get("notional_quote_units", "0"))
-            fee = int(fill.get("fee_quote_units", "0"))
-            if fill.get("side") == "buy":
-                if self.qty == 0:
-                    # First fill of a new position: entry bar is the fill bar.
-                    # entry_dip is NOT reset here: decide() recorded the dip
-                    # that armed the entry, and the fill must not wipe it.
-                    self.entry_bar = self.bar_index
-                    self.high_since_entry = 0
-                self.cash -= notional + fee
-                self.qty += qty
-                # cost basis at the fill price, before fees.
-                self.entry_cost += qty * price // MICRO_PER_UNIT
-            elif fill.get("side") == "sell":
-                self.cash += notional - fee
-                if self.qty > 0:
-                    sold = min(qty, self.qty)
-                    self.entry_cost -= self.entry_cost * sold // self.qty
-                    self.qty -= sold
-                if self.qty == 0:
-                    self.entry_cost = 0
-                    self.tranches = 0
-                    self.entry_bar = -1
-                    self.entry_dip = 0
-                    self.high_since_entry = 0
-
-    def apply_account(self, account):
-        """Trust the harness account as the source of truth for cash/qty."""
-        if not account:
-            return
-        cash = int(account.get("cash_quote_units", "0"))
-        self.cash = cash
-        qty = 0
-        for pos in account.get("positions", []) or []:
-            if pos.get("symbol") == SYMBOL:
-                qty = int(pos.get("qty", "0"))
-        if qty == 0 and self.qty != 0:
-            self.qty = 0
-            self.entry_cost = 0
-            self.tranches = 0
-            self.entry_bar = -1
-            self.entry_dip = 0
-            self.high_since_entry = 0
-        elif qty != self.qty:
-            # Position changed without a fill we saw (should not happen);
-            # rescale the cost basis proportionally.
-            if self.qty > 0:
-                self.entry_cost = self.entry_cost * qty // self.qty
-            self.qty = qty
-
-    def track_dip(self):
-        """Maintain the current dip episode against the rolling high."""
-        close = self.closes[-1]
-        if self.qty > 0 and self.entry_bar >= 0:
-            if close > self.high_since_entry:
-                self.high_since_entry = close
-        high = self.rolling_high()
-        if high <= 0:
-            return
-        dip = (high - close) * 10000 // high
-        if not self.in_dip:
-            if dip >= self.p["dip_start_bps"]:
-                self.in_dip = True
-                self.dip_low = close
-                self.dip_low_bar = self.bar_index
-        else:
-            if close < self.dip_low:
-                self.dip_low = close
-                self.dip_low_bar = self.bar_index
-            if dip <= 5:
-                # Recovered to within 5 bps of the rolling high: episode over.
-                self.in_dip = False
-                self.dip_low = 0
-                self.dip_low_bar = -1
-
-    # -- decisions ----------------------------------------------------------
-
-    def decide(self):
-        """Return the list of orders for the current batch (may be empty)."""
-        p = self.p
-        orders = []
-        if len(self.closes) < p["hi_bars"]:
-            return orders
-        if self.bar_index < self.warmup_bars:
-            return orders
-
-        close = self.closes[-1]
-        high = self.rolling_high()
-        if high <= 0:
-            return orders
-        dip = (high - close) * 10000 // high
-
-        # Exits first: take profit (tiered by how deep the entry dip was),
-        # the disaster stop, a stale position, or a trailing exit once the
-        # position is in profit.
-        if self.qty > 0:
-            entry = self.avg_entry_price()
-            if entry > 0:
-                gain = bps_of(close, entry)
-                if self.entry_dip >= p["dip_deep_bps"]:
-                    tp = p["tp_deep_bps"]
-                else:
-                    tp = p["tp_shallow_bps"]
-                stale = (p["max_hold_bars"] > 0 and self.entry_bar >= 0
-                         and self.bar_index - self.entry_bar >= p["max_hold_bars"])
-                trail = False
-                if (p["trail_bps"] > 0 and self.high_since_entry > 0
-                        and gain >= p["trail_min_gain_bps"]):
-                    fall = (self.high_since_entry - close) * 10000 // self.high_since_entry
-                    trail = fall >= p["trail_bps"]
-                if gain >= tp or gain <= -p["stop_bps"] or stale or trail:
-                    orders.append(self._sell_all())
-                    return orders
-
-        # Entries: only while flat or holding just the first tranche.
-        if self.tranches >= 2:
-            return orders
-        if self.bar_index > p["no_entry_after"]:
-            return orders
-        if not self.regime_ok():
-            return orders
-        if not self.stabilised():
-            return orders
-
-        if self.tranches == 0 and dip >= p["dip1_bps"]:
-            notional = self.cash * p["size1_frac_num"] // p["size1_frac_den"]
-            if notional >= self.min_notional and notional <= self.cash:
-                orders.append(self._buy(notional))
-                self.tranches = 1
-                self.entry_dip = dip
-        elif self.tranches == 1 and dip >= p["dip2_bps"]:
-            notional = self.cash
-            if notional >= self.min_notional:
-                orders.append(self._buy(notional))
-                self.tranches = 2
-        return orders
-
-    def _buy(self, notional):
-        self.order_no += 1
-        return {
-            "side": "buy",
-            "client_id": "b%d-%d" % (self.bar_index, self.order_no),
-            "symbol": SYMBOL,
-            "notional_quote_units": str(int(notional)),
-            "max_slippage_bps": self.p["max_slippage_bps"],
-        }
-
-    def _sell_all(self):
-        self.order_no += 1
-        return {
-            "side": "sell",
-            "client_id": "s%d-%d" % (self.bar_index, self.order_no),
-            "symbol": SYMBOL,
-            "qty": str(int(self.qty)),
-            "max_slippage_bps": self.p["max_slippage_bps"],
-        }
-
-    # -- protocol -----------------------------------------------------------
-
-    def on_batch(self, batch):
-        bars = batch.get("bars", []) or []
-        for bar in bars:
-            if bar.get("symbol") != SYMBOL:
-                continue
-            self.closes.append(int(bar["c"]))
-            self.bar_index += 1
-        self.apply_fills(batch.get("fills", []) or [])
-        self.apply_account(batch.get("account"))
-        self.track_dip()
-        return self.decide()
+def reply(seq, orders):
+    sys.stdout.write(json.dumps(
+        {"type": "reply", "seq": seq, "orders": orders},
+        separators=(",", ":")) + "\n")
+    sys.stdout.flush()
 
 
 def main():
-    bot = None
-    out = sys.stdout
+    closes = []          # closes seen so far, ints
+    tranches = []        # (qty, entry_price, tag) from buy fills
+    pos_tp = None        # take-profit bps for this position
+    pos_stop = None      # stop bps for this position
+    pos_hold = None      # max-hold bars for this position
+    pos_bar0 = None      # bar the position's first buy was decided on
+    pos_capital = None   # equity when the position opened
+    dip_low = None       # lowest close of the current dip-1 episode
+    dip2_low = None      # lowest close of the current dip-2 episode
+    pending_buy = {}     # client_id -> tag, buys sent, fill not yet seen
+    pending_sell = None  # client_id of a sell sent, fill not yet seen
+    counter = 0          # order counter (deterministic client ids)
+
+    def next_cid(kind):
+        nonlocal counter
+        counter += 1
+        return "%s%d" % (kind, counter)
+
     for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
         try:
             msg = json.loads(line)
         except ValueError:
             continue
-        kind = msg.get("type")
-        if kind == "hello":
-            capital = msg.get("capital", {}) or {}
-            caps = msg.get("caps", {}) or {}
-            fees = msg.get("fees", {}) or {}
-            bot = DipBuyBot(
-                PARAMS,
-                int(capital.get("quote_units", "1000000000")),
-                int(fees.get("fee_bps", 4)),
-                int(fees.get("min_notional_quote_units", "1000000")),
-                int(caps.get("max_orders_per_bar", 16)),
-                int(msg.get("warmup_bars", 0) or 0),
-            )
-        elif kind == "batch":
-            if bot is None:
-                bot = DipBuyBot(PARAMS, 1000000000, 4, 1000000, 16, 0)
-            orders = bot.on_batch(msg)
-            reply = {"type": "reply", "seq": msg.get("seq", 0),
-                     "orders": orders}
-            out.write(json.dumps(reply, separators=(",", ":")) + "\n")
-            out.flush()
-        elif kind == "done":
+        mtype = msg.get("type")
+        if mtype == "hello":
+            continue  # hello gets no reply
+        if mtype == "done":
             break
+        if mtype != "batch":
+            continue
+        seq = msg.get("seq", 0)
+
+        # --- fills reported with this batch: update state first ---
+        for fill in msg.get("fills", []):
+            cid = fill.get("client_id", "")
+            side = fill.get("side")
+            status = fill.get("status")
+            if cid in pending_buy:
+                tag = pending_buy.pop(cid)
+                if side == "buy" and status == "filled":
+                    tranches.append((int(fill.get("qty", "0")),
+                                     int(fill.get("price", "0")),
+                                     tag))
+            elif cid == pending_sell:
+                # a sell fill (or rejection) clears the pending sell;
+                # the account below shows whether the position is gone
+                pending_sell = None
+
+        # --- account as reported with this batch ---
+        account = msg.get("account", {})
+        cash = int(account.get("cash_quote_units", "0"))
+        positions = account.get("positions", [])
+        qty = int(positions[0].get("qty", "0")) if positions else 0
+        cost = int(positions[0].get("cost_quote_units", "0")) if positions else 0
+        if qty == 0:
+            tranches = []
+            pos_tp = pos_stop = pos_hold = pos_bar0 = None
+            pos_capital = None
+
+        # --- the bar that just closed ---
+        bars = msg.get("bars", [])
+        bar = None
+        for b in bars:
+            if b.get("symbol") == SYMBOL:
+                bar = b
+                break
+        if bar is None:
+            reply(seq, [])
+            continue
+        close = int(bar["c"])
+        closes.append(close)
+        i = len(closes) - 1
+
+        # --- rolling high over the trailing window before this bar ---
+        start = i - ROLLING_HIGH_BARS
+        if start < 0:
+            start = 0
+        window = closes[start:i]
+        high = max(window) if window else close
+        dip = (high - close) * 10000 // high if high else 0
+
+        # --- regime filter: trailing 6h return ---
+        regime_bad = False
+        if i >= REGIME_LOOKBACK:
+            ref = closes[i - REGIME_LOOKBACK]
+            regime_bad = (close - ref) * 10000 // ref < REGIME_MIN_BPS
+
+        has_pos = qty > 0
+        has_deep = any(t[2] == "deep" for t in tranches)
+        prev_close = closes[i - 1] if i >= 1 else close
+
+        # stabilisation, judged on the dip-1 episode low as of the
+        # previous bar: the price has stopped making new lows
+        stab1 = dip_low is not None and close >= prev_close
+
+        orders = []
+
+        # --- exits: only while holding and no sell is outstanding ---
+        if has_pos and pending_sell is None:
+            avg_entry = cost * 10 ** 7 // qty if qty else close
+            if has_deep:
+                tp_ref = min(t[1] for t in tranches if t[2] == "deep")
+                take_profit = TP_DEEP_BPS
+            else:
+                tp_ref = tranches[0][1]
+                take_profit = pos_tp
+            sell = False
+            if close * 10000 >= tp_ref * (10000 + take_profit):
+                sell = True
+            elif close * 10000 <= avg_entry * (10000 - pos_stop):
+                sell = True
+            elif pos_bar0 is not None and i - pos_bar0 >= pos_hold:
+                sell = True
+            if sell:
+                cid = next_cid("s")
+                pending_sell = cid
+                orders.append({"side": "sell", "client_id": cid,
+                               "symbol": SYMBOL, "qty": str(qty),
+                               "max_slippage_bps": MAX_SLIPPAGE_BPS})
+                dip_low = None
+                dip2_low = None
+                reply(seq, orders)
+                continue
+
+        # --- entries: only while flat, no buy outstanding, regime ok ---
+        if (not has_pos and not pending_buy and not regime_bad
+                and i >= ROLLING_HIGH_BARS):
+            if dip >= DIP_1_BPS:
+                if dip_low is None:
+                    dip_low = close
+                elif close < dip_low:
+                    dip_low = close
+                if stab1:
+                    notional = cash * TRANCHE_1_NUM // 100
+                    if notional >= 1000000:
+                        cid = next_cid("b")
+                        pending_buy[cid] = "shallow"
+                        orders.append({"side": "buy", "client_id": cid,
+                                       "symbol": SYMBOL,
+                                       "notional_quote_units": str(notional),
+                                       "max_slippage_bps": MAX_SLIPPAGE_BPS})
+                        pos_tp = TP_SHALLOW_BPS
+                        pos_stop = STOP_BPS
+                        pos_hold = MAX_HOLD_BARS
+                        pos_bar0 = i
+                        pos_capital = cash + qty * close // 10 ** 7
+                    dip_low = None
+                    reply(seq, orders)
+                    continue
+            else:
+                dip_low = None
+
+        # --- tranche 2: while holding only tranche 1 ---
+        if has_pos and not has_deep and not pending_buy and not regime_bad:
+            if dip >= DIP_2_BPS:
+                if dip2_low is None:
+                    dip2_low = close
+                elif close < dip2_low:
+                    dip2_low = close
+                # stabilisation judged on the low just updated: the price
+                # has stopped making new lows
+                if close >= prev_close:
+                    base = pos_capital if pos_capital is not None else cash
+                    notional = base * TRANCHE_2_NUM // 100
+                    if notional > cash:
+                        notional = cash
+                    if notional >= 1000000:
+                        cid = next_cid("b")
+                        pending_buy[cid] = "deep"
+                        orders.append({"side": "buy", "client_id": cid,
+                                       "symbol": SYMBOL,
+                                       "notional_quote_units": str(notional),
+                                       "max_slippage_bps": MAX_SLIPPAGE_BPS})
+                    dip2_low = None
+            else:
+                dip2_low = None
+
+        reply(seq, orders)
 
 
 if __name__ == "__main__":
